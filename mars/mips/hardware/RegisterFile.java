@@ -308,6 +308,20 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
          hi.resetValue();
          lo.resetValue();
       }
+
+      /**
+       * Change every general-purpose register's reset value, then reset its
+       * current value.  The program counter and HI/LO are intentionally not
+       * affected.
+       *
+       * @param resetValue value used for the current and subsequent reset state
+       */
+       public static void resetGeneralPurposeRegisters(int resetValue) {
+         for (int i = 0; i < regFile.length; i++) {
+            regFile[i].changeResetValue(resetValue);
+            regFile[i].resetValue();
+         }
+      }
       
      /**
        *  Method to increment the Program counter in the general case (not a jump or branch).

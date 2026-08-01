@@ -99,6 +99,11 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         coERR  -- Output messages of CO extension in stderr (default at stdout).<br>
          coL1  -- set display level at 1 (print std answer).<br>
          coL2  -- set display level at 2 (print std debug messages).<br>
+   coZeroGpr  -- reset all 32 general-purpose registers to zero before simulation.<br>
+ coStrictData  -- enforce the BUAA CO data map, signed effective-address overflow,<br>
+                         and the inclusive configured text-limit word.<br>
+ coHalt=&lt;address&gt; -- require execution to reach a standard course halt loop;<br>
+                         without efc, fetch only aligned PCs in 0x3000..coHalt+4.<br>
            cl  -- load an additional instruction from a .class file.<br>
                   Note that your .class file must be in the same directory as mars.jar.<br>
            ig  -- ignore arithmetic overflow.<br>
@@ -121,6 +126,8 @@ ccw <div>:<mul>:<j/br>:<mem>:<other> -- set the real cycles of each instruction.
       private boolean selfModifyingCode; // Whether to allow self-modifying code (e.g. write to text segment)
       private boolean ignoreArithmeticOverflow;  // Whether to ignore the arithmetic overflow
       private boolean countCycles;  // Whether to count the cycles of the simulator
+      private boolean zeroCourseGeneralPurposeRegisters; // Course reset state: all 32 GPRs are zero.
+      private Integer courseHaltAddress; // Validated standard beq-self + nop loop, or null.
       private int outputLoggingLevel;  // The output logging level: 0, 1 or 2
       private static final String rangeSeparator = "-";
       private static final int splashDuration = 2000; // time in MS to show splash screen
@@ -149,6 +156,11 @@ ccw <div>:<mul>:<j/br>:<mem>:<other> -- set the real cycles of each instruction.
          else { // running from command line.
             // assure command mode works in headless environment (generates exception if not)
             System.setProperty("java.awt.headless", "true"); 
+            // Command-line runs must depend only on their explicit switches,
+            // not on a persisted GUI preference.  efc or p7irq will enable
+            // course exception handling again while parsing this invocation.
+            Globals.getSettings().setExceptionForCourse(false);
+            Globals.getSettings().setStrictDataAccess(false);
             simulate = true;
             displayFormat = HEXADECIMAL;
             verbose = true;  
@@ -159,6 +171,8 @@ ccw <div>:<mul>:<j/br>:<mem>:<other> -- set the real cycles of each instruction.
             startAtMain = false;
             ignoreArithmeticOverflow = false;
             countCycles = false;
+            zeroCourseGeneralPurposeRegisters = false;
+            courseHaltAddress = null;
             outputLoggingLevel = 0;
             countInstructions = false;
 				selfModifyingCode = false;
@@ -436,6 +450,30 @@ ccw <div>:<mul>:<j/br>:<mem>:<other> -- set the real cycles of each instruction.
                   continue;
                }
             }
+            if (args[i].equalsIgnoreCase("coZeroGpr")) {
+               zeroCourseGeneralPurposeRegisters = true;
+               continue;
+            }
+            if (args[i].equalsIgnoreCase("coStrictData")) {
+               Globals.getSettings().setStrictDataAccess(true);
+               continue;
+            }
+            if (args[i].toLowerCase().startsWith("cohalt=")) {
+               String value = args[i].substring(7);
+               try {
+                  int address = Binary.stringToInt(value);
+                  if ((address & 0x3) != 0 || courseHaltAddress != null) {
+                     throw new NumberFormatException();
+                  }
+                  courseHaltAddress = new Integer(address);
+                  continue;
+               }
+               catch (NumberFormatException nfe) {
+                  out.println("Invalid coHalt address: " + value);
+                  argsOK = false;
+                  continue;
+               }
+            }
             if (args[i].equalsIgnoreCase("coERR")) { // added 1-Nov-2022, by Toby to support BUAA CO.
                Globals.displayOutput = System.err;
                continue;
@@ -536,6 +574,10 @@ ccw <div>:<mul>:<j/br>:<mem>:<other> -- set the real cycles of each instruction.
             out.println("Invalid Command Argument: "+args[i]);
             argsOK = false;
          }
+         if (courseHaltAddress != null && (!simulate || maxSteps <= 0)) {
+            out.println("coHalt requires simulation with a positive maximum step count.");
+            argsOK = false;
+         }
          return argsOK;
       }
       
@@ -596,6 +638,17 @@ ccw <div>:<mul>:<j/br>:<mem>:<other> -- set the real cycles of each instruction.
             RegisterFile.initializeProgramCounter(startAtMain); // DPS 3/9/09
             Coprocessor0.resetRegisters();
             if (simulate) {
+               if (courseHaltAddress != null && !isStandardCourseHaltLoop(courseHaltAddress.intValue())) {
+                  failCourseHalt("Invalid course halt target " + Binary.intToHexString(courseHaltAddress.intValue()) +
+                     ": expected machine words 0x1000ffff and 0x00000000.");
+                  return false;
+               }
+               if (zeroCourseGeneralPurposeRegisters) {
+                  // BUAA CO hardware reset specifies zero for every GPR.  Apply
+                  // this only after assembly and before the first simulated
+                  // instruction; PC and HI/LO retain their normal MARS state.
+                  RegisterFile.resetGeneralPurposeRegisters(0);
+               }
                // store program args (if any) in MIPS memory
                new ProgramArgumentList(programArgumentList).storeProgramArguments();
             	// establish observer if specified  
@@ -604,8 +657,23 @@ ccw <div>:<mul>:<j/br>:<mem>:<other> -- set the real cycles of each instruction.
                   out.println("--------  SIMULATION BEGINS  -----------");
                }
                programRan = true;
+               Simulator.getInstance().configureCourseHalt(courseHaltAddress);
                boolean done = code.simulate(maxSteps);
-               if (!done) {
+               if (courseHaltAddress != null) {
+                  int haltAddress = courseHaltAddress.intValue();
+                  if (done && Simulator.getInstance().getLastTerminationReason() == Simulator.COURSE_HALT) {
+                     out.println("Program reached course halt loop at " + Binary.intToHexString(haltAddress) + ".");
+                  }
+                  else if (done) {
+                     failCourseHalt("Program terminated before reaching course halt loop at " +
+                        Binary.intToHexString(haltAddress) + ".");
+                  }
+                  else {
+                     failCourseHalt("Program exhausted maximum step limit " + maxSteps +
+                        " outside course halt loop at " + Binary.intToHexString(haltAddress) + ".");
+                  }
+               }
+               else if (!done) {
                   out.println("\nProgram terminated when maximum step limit "+maxSteps+" reached.");
                }
             }
@@ -619,6 +687,23 @@ ccw <div>:<mul>:<j/br>:<mem>:<other> -- set the real cycles of each instruction.
                out.println("Processing terminated due to errors.");
             } 
          return programRan;
+      }
+
+      private boolean isStandardCourseHaltLoop(int address) {
+         try {
+            ProgramStatement branch = Globals.memory.getStatementNoNotify(address);
+            ProgramStatement delaySlot = Globals.memory.getStatementNoNotify(address + Instruction.INSTRUCTION_LENGTH);
+            return branch != null && delaySlot != null &&
+               branch.getBinaryStatement() == 0x1000FFFF && delaySlot.getBinaryStatement() == 0;
+         }
+         catch (AddressErrorException aee) {
+            return false;
+         }
+      }
+
+      private void failCourseHalt(String message) {
+         Globals.exitCode = simulateErrorExitCode == 0 ? 1 : simulateErrorExitCode;
+         out.println(message);
       }
    
    
@@ -932,6 +1017,19 @@ ccw <div>:<mul>:<j/br>:<mem>:<other> -- set the real cycles of each instruction.
          out.println("   coERR  -- Output messages of CO extension in stderr (default at stdout).");
          out.println("    coL1  -- set display level at 1 (print std answer).");
          out.println("    coL2  -- set display level at 2 (print std debug messages).");
+         out.println("coZeroGpr  -- reset all 32 general-purpose registers to zero before simulation.");
+         out.println("coStrictData  -- restrict simulated load/store addresses to the BUAA CO data map");
+         out.println("                 and reject signed effective-address overflow.");
+         out.println("                 Course assembly/dumps also include the configured final");
+         out.println("                 text/kernel-text word (0x6ffc in CompactLargeText).");
+         out.println("coHalt=<address> -- require a positive step limit and execution of the standard");
+         out.println("                 0x1000ffff / 0x00000000 halt loop at the given address.");
+         out.println("                 Without efc, fetched PCs must be word-aligned and in");
+         out.println("                 0x00003000..coHalt+4 (never above 0x00006ffc).");
+         out.println("                 With efc, aligned PCs in the course range must also be in");
+         out.println("                 the merged image ending at the contiguous 0x4180 handler;");
+         out.println("                 its plugin-filled gap executes as NOP.");
+         out.println("                 With coStrictData+efc, enforce the P7 handler/IG test contract.");
          out.println("      cl <class> -- load an additional instruction from a .class file.");
          out.println("             Note that your .class file must be in the same directory as mars.jar.");
          out.println("      ig  -- ignore arithmetic overflow.");

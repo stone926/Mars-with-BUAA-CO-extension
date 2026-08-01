@@ -43,6 +43,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       private ErrorList errs;
       private boolean epcNotAligned;
       private boolean isCourseException;
+      private boolean isCourseContractViolation;
    
    /**
     * Constructor for ProcessingException.
@@ -85,6 +86,22 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       		// be stored at that address.  So now I use the program counter (which has already
       		// been incremented).
          epcNotAligned = false;
+      }
+
+   /**
+    * Create a fatal host-side course test-contract violation.  Unlike a MIPS
+    * exception, this must never be dispatched back into the simulated handler.
+    *
+    * @param ps instruction which violated the test contract
+    * @param detail concise diagnostic following the stable contract prefix
+    * @return ProcessingException marked for immediate simulator termination
+    */
+       public static ProcessingException courseContractViolation(
+         ProgramStatement ps, String detail) {
+         ProcessingException pe = new ProcessingException(ps,
+            "Course P7 test contract violation: " + detail);
+         pe.isCourseContractViolation = true;
+         return pe;
       }
    
    
@@ -188,6 +205,14 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     **/
        public boolean isCourseException() {
          return isCourseException;
-       }
+      }
+
+   /**
+    * Whether this represents an invalid P7 testbench interaction rather than
+    * an exception that the simulated MIPS handler may process.
+    */
+       public boolean isCourseContractViolation() {
+         return isCourseContractViolation;
+      }
 
    }

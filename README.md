@@ -17,11 +17,11 @@
 
 ```sh
 # 非 P7（P4–P6）：打印寄存器/内存写、开延迟槽、干净输出
-java -jar Mars.jar test.asm nc db mc CompactLargeText coL1
+java -jar Mars.jar test.asm nc db mc CompactLargeText coZeroGpr coStrictData coL1
 
 # P7：加 efc（异常/中断处理）；要测外部中断再加 p7irq=
-java -jar Mars.jar test.asm nc db mc CompactLargeText efc coL1
-java -jar Mars.jar test.asm nc db mc CompactLargeText efc coL1 p7irq=0x3100
+java -jar Mars.jar test.asm nc db mc CompactLargeText coZeroGpr coStrictData efc coL1
+java -jar Mars.jar test.asm nc db mc CompactLargeText coZeroGpr coStrictData efc coL1 p7irq=0x3100
 ```
 
 `coL1` 输出格式（与课程 P4 要求一致，可直接与 testbench 的 `$display` 对拍）：
@@ -40,6 +40,8 @@ java -jar Mars.jar test.asm nc db mc CompactLargeText efc coL1 p7irq=0x3100
 | 参数 | 作用 |
 |---|---|
 | **`coL1`** | **对拍核心**：打印寄存器写 / 内存写（P4 格式）。写 `$0` 不打印 |
+| **`coZeroGpr`** | 仿真前把 32 个通用寄存器的当前值和本次 reset 初态全部置 0，以匹配课程 CPU；不改变 PC、HI/LO、内存布局或汇编结果 |
+| **`coStrictData`** | 对仿真中的 load/store 启用课程数据地址检查，并拒绝有符号有效地址加法溢出。P3–P6 只允许完整访问 `0x0000~0x2fff`；与 `efc` 同用时另允许 Timer0/1 与中断发生器。它还使课程内存配置的 text/kernel-text limit 成为可用的最后一个 word 地址，从而完整支持 `0x3000~0x6ffc` 的 4096-word IM（包括 `.ktext` handler 的末字） |
 | **`mc <config>`** | 内存配置。课程常用 **`CompactLargeText`**（text@0x3000、异常入口 0x4180）。P7 `efc` 模式按课程取指范围限制在 `0x3000~0x6FFC`；P4–P6 测试数据可能非法时可用 `FixedCompactLargeText`（异常处理段放到用户数据之外，便于单独编写） |
 | **`db`** | 启用 MIPS 延迟槽（**P5/P6/P7 必须**；否则跳转/分支后那条指令不会执行，与流水线 CPU 不一致，导致对拍出错） |
 | **`efc`** | **启用 P7 异常/中断处理**：CP0（SR/Cause/EPC）建模、异常派发到 0x4180、按 BUAA 语义设置 EPC/BD/EXL/ExcCode、定时器与中断 |
@@ -52,6 +54,8 @@ java -jar Mars.jar test.asm nc db mc CompactLargeText efc coL1 p7irq=0x3100
 |---|---|
 | `coL2` | 调试级输出：逐条打印 `@PC -> 汇编 (机器码)` 及读写，便于单步查错 |
 | `coERR` | 把本扩展打印的内容输出到 `stderr`（默认 `stdout`） |
+| `coHalt=0x...` | 与正数最大步数参数同用；先验证指定地址是 `0x1000ffff` + `0x00000000` 标准停机环。非 `efc` 运行的每次取指还必须四字节对齐且位于 `0x3000..coHalt+4`（并不超过 `0x6ffc`）。`efc` 对未对齐或教程取指域外地址仍按 P7 AdEL/handler 处理；若存在从 `0x4180` 开始的连续 handler，则按插件 merge 结果把用户停机延迟槽之后至 `0x417c` 视为填零 NOP，并只允许取指到该 handler 的首个空 word 之前；若不存在 handler，则仍止于 `coHalt+4`。数值合法但未装入 DUT 的稀疏 `.ktext` 会直接报告 oracle 错误。无延迟槽时成功执行自环分支即以专用原因停止；有延迟槽时还必须成功执行紧随其后的 nop（直接跳到 nop 不算）。CLIFF、其他自环、非法取指、错误目标或预算耗尽均按仿真失败退出 |
+| `coStrictData + efc + coHalt` | 自动启用 P7 测试契约：中断发生器仅能由已装载 handler 中机器码恰为 `0xa0007f20` 的 `sb $0,0x7f20($0)` 实际访问；handler 内同步异常以及入场后新增的 `HWInt` 上升位会直接以 `Course P7 test contract violation` 终止 oracle，不再嵌套派发。入场时已经 pending、随后由 handler 清除的中断仍合法 |
 | `ig` | 忽略全部算术溢出（**对拍 P7 溢出异常时不要加**） |
 | `a` | 只汇编、不仿真（配合 `dump`） |
 | `dump <段> <格式> <文件>` | 导出内存段。导出机器码：`a dump .text HexText code.txt test.asm`；导出内核段：`a dump 0x00004180-0x00004ffc HexText kernel.txt test.asm` |
@@ -281,6 +285,9 @@ java -jar Mars.jar testcode.asm mc CompactLargeText coL1 cl behlbal.class ig
 | 参数 | 来源 | 说明 |
 |------|------|------|
 | `coL1` / `coL2` / `coERR` | 本 Mars 新增 | trace 输出和重定向 |
+| `coZeroGpr` | 本 Mars 新增 | 仅显式启用时，将全部 GPR 的当前值与 reset 值置 0；普通 MARS 默认的 `$gp`/`$sp` 初值不受影响 |
+| `coStrictData` | 本 Mars 新增 | 仅显式启用时约束模拟 load/store 的完整访问范围、拒绝有符号有效地址加法溢出，并在汇编/dump 时把配置的 text limit 作为最后一个合法 word 地址；未带此 flag/`efc` 的普通 MARS 保持原行为 |
+| `coHalt=0x...` | 本 Mars 新增 | opt-in 的课程完成判据；验证并追踪标准自环分支；P7 有连续 handler 时，实际装载域按插件 merge 规则为 `0x3000..kernelEnd`，中间 padding 无条件执行为 NOP；无 handler 时止于 `coHalt+4`。这会杜绝稀疏 `.ktext`/停机环后 statement 绕过，同时保留 P7 数值域外及未对齐取指的 AdEL/handler 语义 |
 | `efc` | 本 Mars 新增（参考官方 P7 Mars 的 `SettingsExceptionForCourse` GUI 开关，改造为命令行参数） | 启用全部 P7 异常/中断/CP0/定时器处理 |
 | `p7irq=0x..,0x..` | 本 Mars 新增 | 外部中断调度；自动启用 `efc` |
 | `ig` | 本 Mars 新增 | 忽略算术溢出（对拍时通常不加） |

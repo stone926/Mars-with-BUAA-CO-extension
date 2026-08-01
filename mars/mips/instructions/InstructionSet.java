@@ -59,15 +59,27 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
       }
 
-      private int effectiveAddress(int baseRegister, int offset, int exceptionCause) throws AddressErrorException {
+      private int effectiveAddress(int baseRegister, int offset, int length, int exceptionCause)
+         throws AddressErrorException, ProcessingException {
          int base = RegisterFile.getValue(baseRegister);
          int signedOffset = offset << 16 >> 16;
          long result = (long) base + (long) signedOffset;
          int address = base + signedOffset;
-         if (Globals.getSettings().getExceptionForCourse() &&
-            (result > Integer.MAX_VALUE || result < Integer.MIN_VALUE)) {
-            throw new AddressErrorException("address calculation overflow",
-               exceptionCause, address);
+         boolean exceptionForCourse = Globals.getSettings().getExceptionForCourse();
+         boolean strictDataAccess = Globals.getSettings().getStrictDataAccess();
+         if (exceptionForCourse || strictDataAccess) {
+            boolean signedOverflow = result > Integer.MAX_VALUE || result < Integer.MIN_VALUE;
+            if (signedOverflow) {
+               throw new AddressErrorException("address calculation overflow",
+                  exceptionCause, address);
+            }
+            int instructionAddress = RegisterFile.getProgramCounter() -
+               Instruction.INSTRUCTION_LENGTH;
+            ProgramStatement currentStatement =
+               Globals.memory.getStatementNoNotify(instructionAddress);
+            Simulator.getInstance().validateCourseP7InterruptGeneratorAccess(
+               currentStatement, address, length, exceptionCause);
+            Globals.memory.validateCourseDataAddress(address, length, exceptionCause);
          }
          return address;
       }
@@ -676,7 +688,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      {
                          RegisterFile.updateRegister(operands[0],
                              Globals.memory.getWord(
-                             effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_LOAD)));
+                             effectiveAddress(operands[2], operands[1], 4, Exceptions.ADDRESS_EXCEPTION_LOAD)));
                      } 
                          catch (AddressErrorException e)
                         {
@@ -706,7 +718,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      {
                          RegisterFile.updateRegister(operands[0],
                              Globals.memory.getWord(
-                             effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_LOAD)));
+                             effectiveAddress(operands[2], operands[1], 4, Exceptions.ADDRESS_EXCEPTION_LOAD)));
                      } 
                          catch (AddressErrorException e)
                         {
@@ -726,7 +738,11 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      int[] operands = statement.getOperands();
                      try
                      {
-                         int address = effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_LOAD);
+                         int address = effectiveAddress(operands[2], operands[1], 1, Exceptions.ADDRESS_EXCEPTION_LOAD);
+                        Globals.memory.validateCourseDataAddress(
+                           address - address % Globals.memory.WORD_LENGTH_BYTES,
+                           address % Globals.memory.WORD_LENGTH_BYTES + 1,
+                           Exceptions.ADDRESS_EXCEPTION_LOAD);
                         int result = RegisterFile.getValue(operands[0]);
                         for (int i=0; i<=address % Globals.memory.WORD_LENGTH_BYTES; i++) {
                            result = Binary.setByte(result,3-i,Globals.memory.getByte(address-i));
@@ -751,7 +767,11 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      int[] operands = statement.getOperands();
                      try
                      {
-                         int address = effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_LOAD);
+                         int address = effectiveAddress(operands[2], operands[1], 1, Exceptions.ADDRESS_EXCEPTION_LOAD);
+                        Globals.memory.validateCourseDataAddress(
+                           address,
+                           Globals.memory.WORD_LENGTH_BYTES - address % Globals.memory.WORD_LENGTH_BYTES,
+                           Exceptions.ADDRESS_EXCEPTION_LOAD);
                         int result = RegisterFile.getValue(operands[0]);
                         for (int i=0; i<=3-(address % Globals.memory.WORD_LENGTH_BYTES); i++) {
                            result = Binary.setByte(result,i,Globals.memory.getByte(address+i));
@@ -777,7 +797,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      try
                      {
                          Globals.memory.setWord(
-                             effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_STORE),
+                             effectiveAddress(operands[2], operands[1], 4, Exceptions.ADDRESS_EXCEPTION_STORE),
                              RegisterFile.getValue(operands[0]));
                      } 
                          catch (AddressErrorException e)
@@ -801,7 +821,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      try
                      {
                          Globals.memory.setWord(
-                             effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_STORE),
+                             effectiveAddress(operands[2], operands[1], 4, Exceptions.ADDRESS_EXCEPTION_STORE),
                              RegisterFile.getValue(operands[0]));
                      } 
                          catch (AddressErrorException e)
@@ -823,7 +843,11 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      int[] operands = statement.getOperands();
                      try
                      {
-                         int address = effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_STORE);
+                         int address = effectiveAddress(operands[2], operands[1], 1, Exceptions.ADDRESS_EXCEPTION_STORE);
+                        Globals.memory.validateCourseDataAddress(
+                           address - address % Globals.memory.WORD_LENGTH_BYTES,
+                           address % Globals.memory.WORD_LENGTH_BYTES + 1,
+                           Exceptions.ADDRESS_EXCEPTION_STORE);
                         int source = RegisterFile.getValue(operands[0]);
                         for (int i=0; i<=address % Globals.memory.WORD_LENGTH_BYTES; i++) {
                            Globals.memory.setByte(address-i,Binary.getByte(source,3-i));
@@ -847,7 +871,11 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      int[] operands = statement.getOperands();
                      try
                      {
-                         int address = effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_STORE);
+                         int address = effectiveAddress(operands[2], operands[1], 1, Exceptions.ADDRESS_EXCEPTION_STORE);
+                        Globals.memory.validateCourseDataAddress(
+                           address,
+                           Globals.memory.WORD_LENGTH_BYTES - address % Globals.memory.WORD_LENGTH_BYTES,
+                           Exceptions.ADDRESS_EXCEPTION_STORE);
                         int source = RegisterFile.getValue(operands[0]);
                         for (int i=0; i<=3-(address % Globals.memory.WORD_LENGTH_BYTES); i++) {
                            Globals.memory.setByte(address+i,Binary.getByte(source,i));
@@ -1313,7 +1341,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      {
                          RegisterFile.updateRegister(operands[0],
                              Globals.memory.getByte(
-                             effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_LOAD))
+                             effectiveAddress(operands[2], operands[1], 1, Exceptions.ADDRESS_EXCEPTION_LOAD))
                                              << 24
                                              >> 24);
                      } 
@@ -1337,7 +1365,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      {
                          RegisterFile.updateRegister(operands[0],
                              Globals.memory.getHalf(
-                             effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_LOAD))
+                             effectiveAddress(operands[2], operands[1], 2, Exceptions.ADDRESS_EXCEPTION_LOAD))
                                              << 16
                                              >> 16);
                      } 
@@ -1362,7 +1390,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      // offset is sign-extended and loaded halfword value is zero-extended
                          RegisterFile.updateRegister(operands[0],
                              Globals.memory.getHalf(
-                             effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_LOAD))
+                             effectiveAddress(operands[2], operands[1], 2, Exceptions.ADDRESS_EXCEPTION_LOAD))
                                              & 0x0000ffff);
                      } 
                          catch (AddressErrorException e)
@@ -1385,7 +1413,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      {
                          RegisterFile.updateRegister(operands[0],
                              Globals.memory.getByte(
-                             effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_LOAD))
+                             effectiveAddress(operands[2], operands[1], 1, Exceptions.ADDRESS_EXCEPTION_LOAD))
                                              & 0x000000ff);
                      } 
                          catch (AddressErrorException e)
@@ -1407,7 +1435,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      try
                      {
                          Globals.memory.setByte(
-                             effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_STORE),
+                             effectiveAddress(operands[2], operands[1], 1, Exceptions.ADDRESS_EXCEPTION_STORE),
                                      RegisterFile.getValue(operands[0])
                                              & 0x000000ff);
                      } 
@@ -1430,7 +1458,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      try
                      {
                          Globals.memory.setHalf(
-                             effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_STORE),
+                             effectiveAddress(operands[2], operands[1], 2, Exceptions.ADDRESS_EXCEPTION_STORE),
                                      RegisterFile.getValue(operands[0])
                                              & 0x0000ffff);
                      } 
@@ -2753,7 +2781,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      {
                         Coprocessor1.updateRegister(operands[0],
                             Globals.memory.getWord(
-                            effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_LOAD)));
+                            effectiveAddress(operands[2], operands[1], 4, Exceptions.ADDRESS_EXCEPTION_LOAD)));
                      } 
                          catch (AddressErrorException e)
                         {
@@ -2776,7 +2804,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      }
                      try
                      {
-                        int address = effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_LOAD);
+                        int address = effectiveAddress(operands[2], operands[1], 8, Exceptions.ADDRESS_EXCEPTION_LOAD);
                         // IF statement added by DPS 13-July-2011.
                         if (!Globals.memory.doublewordAligned(address)) {
                            throw new AddressErrorException("address not aligned on doubleword boundary ",
@@ -2808,7 +2836,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      try
                      {
                         Globals.memory.setWord(
-                            effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_STORE),
+                            effectiveAddress(operands[2], operands[1], 4, Exceptions.ADDRESS_EXCEPTION_STORE),
                             Coprocessor1.getValue(operands[0]));
                      } 
                          catch (AddressErrorException e)
@@ -2832,7 +2860,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      }
                      try
                      {
-                        int address = effectiveAddress(operands[2], operands[1], Exceptions.ADDRESS_EXCEPTION_STORE);
+                        int address = effectiveAddress(operands[2], operands[1], 8, Exceptions.ADDRESS_EXCEPTION_STORE);
                         // IF statement added by DPS 13-July-2011.
                         if (!Globals.memory.doublewordAligned(address)) {
                            throw new AddressErrorException("address not aligned on doubleword boundary ",

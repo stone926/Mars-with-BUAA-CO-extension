@@ -49,6 +49,10 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       private SimThread simulatorThread;
       private static Simulator simulator = null;  // Singleton object
       private static Runnable interactiveGUIUpdater = null;
+      private volatile Integer courseHaltAddress = null;
+      private volatile boolean courseHaltDelaySlotPending = false;
+      private volatile int courseP7KernelTextEnd = 0x0000417C;
+      private volatile int lastTerminationReason = 0;
       // Others can set this true to indicate external interrupt.  Initially used
    	// to simulate keyboard and display interrupts.  The device is identified
    	// by the address of its MMIO control register.  keyboard 0xFFFF0000 and
@@ -62,6 +66,11 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       public static final int NORMAL_TERMINATION = 4;
       public static final int CLIFF_TERMINATION = 5; // run off bottom of program
       public static final int PAUSE_OR_STOP = 6;
+      public static final int COURSE_HALT = 7;
+      private static final int COURSE_TEXT_BASE = 0x00003000;
+      private static final int COURSE_TEXT_LIMIT = 0x00006FFC;
+      private static final int COURSE_TEXT_EXCLUSIVE_LIMIT = 0x00007000;
+      private static final int COURSE_P7_KERNEL_TEXT_BASE = 0x00004180;
    
       /**
    	 * Returns the Simulator object
@@ -84,6 +93,77 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
          if (Globals.getGui() != null) {
             interactiveGUIUpdater = new UpdateGUI();
          } 
+      }
+
+      /**
+       * Configure an optional command-line course halt target for the next run.
+       * Passing null disables tracking.  The caller validates the instruction
+       * pair before simulation.  For P7, this also snapshots the contiguous
+       * handler prefix that the plugin dumps beginning at 0x4180.  Completion
+       * is recorded only after the branch itself (no delay slots) or its nop
+       * delay slot (delayed branching) has executed successfully after
+       * interrupt/exception prechecks.
+       */
+       public void configureCourseHalt(Integer address) {
+         courseHaltAddress = address;
+         courseHaltDelaySlotPending = false;
+         courseP7KernelTextEnd = COURSE_P7_KERNEL_TEXT_BASE - Instruction.INSTRUCTION_LENGTH;
+         if (address != null && Globals.getSettings().getExceptionForCourse()) {
+            try {
+               // Match the plugin's kernel dump: only the contiguous prefix
+               // beginning at 0x4180 is loaded into the DUT instruction memory.
+               courseP7KernelTextEnd = Globals.memory.getAddressOfFirstNull(
+                  COURSE_P7_KERNEL_TEXT_BASE, COURSE_TEXT_EXCLUSIVE_LIMIT) -
+                  Instruction.INSTRUCTION_LENGTH;
+            }
+            catch (AddressErrorException aee) {
+               // Constants above are word-aligned.  Treat an unexpected memory
+               // configuration failure as an empty loaded handler interval.
+               courseP7KernelTextEnd = COURSE_P7_KERNEL_TEXT_BASE -
+                  Instruction.INSTRUCTION_LENGTH;
+            }
+         }
+         lastTerminationReason = 0;
+      }
+
+       public int getLastTerminationReason() {
+         return lastTerminationReason;
+      }
+
+       public boolean isCourseP7TestContractEnabled() {
+         return courseHaltAddress != null &&
+            Globals.getSettings().getExceptionForCourse() &&
+            Globals.getSettings().getStrictDataAccess();
+      }
+
+       public boolean isLoadedCourseP7HandlerAddress(int address) {
+         return address >= COURSE_P7_KERNEL_TEXT_BASE &&
+            address <= courseP7KernelTextEnd;
+      }
+
+       public void validateCourseP7InterruptGeneratorAccess(
+         ProgramStatement statement, int address, int length, int exceptionCause)
+         throws ProcessingException {
+         if (!isCourseP7TestContractEnabled()) {
+            return;
+         }
+         long endAddress = (long) address + (long) length - 1L;
+         if (endAddress < 0x00007F20L || address > 0x00007F23) {
+            return;
+         }
+         int instructionAddress = RegisterFile.getProgramCounter() -
+            Instruction.INSTRUCTION_LENGTH;
+         boolean exactResponseInstruction =
+            exceptionCause == Exceptions.ADDRESS_EXCEPTION_STORE &&
+            address == 0x00007F20 && length == 1 &&
+            statement.getBinaryStatement() == 0xA0007F20 &&
+            isLoadedCourseP7HandlerAddress(instructionAddress);
+         if (!exactResponseInstruction) {
+            throw ProcessingException.courseContractViolation(statement,
+               "interrupt-generator access at " + Binary.intToHexString(address) +
+               " from PC " + Binary.intToHexString(instructionAddress) +
+               " must be the loaded-handler instruction 0xa0007f20.");
+         }
       }
    
    
@@ -246,9 +326,106 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             stopper = actor;
          }
 
-          private boolean isInvalidCourseFetchAddress(int address) {
+          private boolean isInvalidCourseFetchAddress(int address, long upperAddress) {
             return (address % Instruction.INSTRUCTION_LENGTH) != 0 ||
-               address < 0x00003000 || address > 0x00006FFC;
+               address < COURSE_TEXT_BASE || (long) address > upperAddress;
+         }
+
+          private boolean isInvalidP7FetchAddress(int address) {
+            return isInvalidCourseFetchAddress(address, COURSE_TEXT_LIMIT);
+         }
+
+          private long getCourseUserTextLimit() {
+            long haltDelaySlot = (long) courseHaltAddress.intValue() +
+               Instruction.INSTRUCTION_LENGTH;
+            return Math.min(haltDelaySlot, COURSE_TEXT_LIMIT);
+         }
+
+          private boolean isInvalidNonP7CourseFetchAddress(int address) {
+            return courseHaltAddress != null &&
+               isInvalidCourseFetchAddress(address, getCourseUserTextLimit());
+         }
+
+          private boolean hasLoadedP7CourseHandler() {
+            return courseP7KernelTextEnd >= COURSE_P7_KERNEL_TEXT_BASE;
+         }
+
+          private boolean isUnloadedP7CourseFetchAddress(int address) {
+            if (courseHaltAddress == null) {
+               return false;
+            }
+            long loadedEnd = hasLoadedP7CourseHandler()
+               ? (long) courseP7KernelTextEnd : getCourseUserTextLimit();
+            return address < COURSE_TEXT_BASE || (long) address > loadedEnd;
+         }
+
+          private boolean isP7CoursePaddingAddress(int address) {
+            return courseHaltAddress != null && hasLoadedP7CourseHandler() &&
+               (long) address > getCourseUserTextLimit() &&
+               address < COURSE_P7_KERNEL_TEXT_BASE;
+         }
+
+          private ProgramStatement getCourseStatement(int address)
+            throws AddressErrorException {
+            // The plugin emits zero words between the user halt delay slot and
+            // the handler at 0x4180.  Execute those words as NOP even if MARS
+            // happens to retain a sparse .ktext statement in that padding.
+            if (Globals.getSettings().getExceptionForCourse() &&
+               isP7CoursePaddingAddress(address)) {
+               ProgramStatement paddingNop = new ProgramStatement(0, address);
+               paddingNop.setBasicAssemblyStatement("nop");
+               paddingNop.setMachineStatement(Binary.intToBinaryString(0));
+               return paddingNop;
+            }
+            return Globals.memory.getStatement(address);
+         }
+
+          private boolean isUnloadedP7CourseHandler() {
+            return courseHaltAddress != null &&
+               isUnloadedP7CourseFetchAddress(Memory.exceptionHandlerAddress);
+         }
+
+          private Boolean terminateCourseInstructionAddressError(int address, int stoppedPC) {
+            String expectedRanges = "the loaded user range 0x00003000 through " +
+               Binary.intToHexString((int) getCourseUserTextLimit());
+            if (Globals.getSettings().getExceptionForCourse()) {
+               if (hasLoadedP7CourseHandler()) {
+                  expectedRanges = "the loaded course image 0x00003000 through " +
+                     Binary.intToHexString(courseP7KernelTextEnd);
+               }
+               else {
+                  expectedRanges += " (no contiguous P7 handler was loaded at 0x00004180)";
+               }
+            }
+            ErrorList errors = new ErrorList();
+            errors.add(new ErrorMessage((MIPSprogram)null, 0, 0,
+               "Course instruction address out of range: " + Binary.intToHexString(address) +
+               "; expected " + expectedRanges + "."));
+            this.pe = new ProcessingException(errors);
+            this.constructReturnReason = EXCEPTION;
+            this.done = true;
+            SystemIO.resetFiles();
+            Simulator.getInstance().notifyObserversOfExecutionStop(maxSteps, stoppedPC);
+            return new Boolean(done);
+         }
+
+          private Boolean terminateCourseP7ContractViolation(
+            ProcessingException violation, int stoppedPC) {
+            this.pe = violation;
+            this.constructReturnReason = EXCEPTION;
+            this.done = true;
+            SystemIO.resetFiles();
+            Simulator.getInstance().notifyObserversOfExecutionStop(maxSteps, stoppedPC);
+            return new Boolean(done);
+         }
+
+          private ProcessingException newCourseP7HwIntRiseViolation(
+            ProgramStatement statement, int entryHwInt, int previousHwInt) {
+            int newBits = Globals.HWInt & ~previousHwInt;
+            return ProcessingException.courseContractViolation(statement,
+               "new HWInt bit(s) " + Binary.intToHexString(newBits) +
+               " rose while executing the loaded handler; entry HWInt was " +
+               Binary.intToHexString(entryHwInt) + ".");
          }
 
           private ProgramStatement dispatchCourseFetchException() {
@@ -292,9 +469,18 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
          	
             RegisterFile.initializeProgramCounter(pc);
             ProgramStatement statement = null;
+            int initialPC = RegisterFile.getProgramCounter();
+            if (!Globals.getSettings().getExceptionForCourse() &&
+               isInvalidNonP7CourseFetchAddress(initialPC)) {
+               return terminateCourseInstructionAddressError(initialPC, initialPC);
+            }
             try {
                if (Globals.getSettings().getExceptionForCourse() &&
-                  isInvalidCourseFetchAddress(RegisterFile.getProgramCounter())) {
+                  isInvalidP7FetchAddress(initialPC)) {
+                  if (isUnloadedP7CourseHandler()) {
+                     return terminateCourseInstructionAddressError(
+                        Memory.exceptionHandlerAddress, initialPC);
+                  }
                   statement = dispatchCourseFetchException();
                   if (statement == null) {
                      this.pe = new ProcessingException(Exceptions.ADDRESS_EXCEPTION_LOAD, true);
@@ -304,12 +490,21 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      Simulator.getInstance().notifyObserversOfExecutionStop(maxSteps, pc);
                      return new Boolean(done);
                   }
-               } else {
-                  statement = Globals.memory.getStatement(RegisterFile.getProgramCounter());
+               }
+               else if (Globals.getSettings().getExceptionForCourse() &&
+                  isUnloadedP7CourseFetchAddress(initialPC)) {
+                  return terminateCourseInstructionAddressError(initialPC, initialPC);
+               }
+               else {
+                  statement = getCourseStatement(RegisterFile.getProgramCounter());
                }
             } 
                 catch (AddressErrorException e) {
                   if (Globals.getSettings().getExceptionForCourse()) {
+                     if (isUnloadedP7CourseHandler()) {
+                        return terminateCourseInstructionAddressError(
+                           Memory.exceptionHandlerAddress, initialPC);
+                     }
                      statement = dispatchCourseFetchException();
                      if (statement != null) {
                         // Continue simulation at the course exception handler.
@@ -373,8 +568,31 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             
             // P7: previous IRQ state for interrupt checking
             boolean prevIRQ = false;
+            boolean courseP7HandlerActive = false;
+            int courseP7HandlerEntryHwInt = 0;
+            int courseP7HandlerPreviousHwInt = 0;
 
             while (statement != null) {
+               pc = RegisterFile.getProgramCounter(); // added: 7/26/06 (explanation above)
+               if (Simulator.getInstance().isCourseP7TestContractEnabled()) {
+                  boolean inLoadedHandler =
+                     Simulator.getInstance().isLoadedCourseP7HandlerAddress(pc);
+                  if (inLoadedHandler && !courseP7HandlerActive) {
+                     courseP7HandlerActive = true;
+                     courseP7HandlerEntryHwInt = Globals.HWInt;
+                     courseP7HandlerPreviousHwInt = Globals.HWInt;
+                  }
+                  else if (!inLoadedHandler) {
+                     courseP7HandlerActive = false;
+                     courseP7HandlerEntryHwInt = 0;
+                     courseP7HandlerPreviousHwInt = 0;
+                  }
+               }
+               else {
+                  courseP7HandlerActive = false;
+                  courseP7HandlerEntryHwInt = 0;
+                  courseP7HandlerPreviousHwInt = 0;
+               }
                // P7: enable timers at start of each instruction cycle
                if (Globals.getSettings().getExceptionForCourse()) {
                   TimerOne.setEnable(true);
@@ -388,14 +606,24 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      Globals.getSettings().markP7IrqFired(p7irqPC);
                   }
                }
-               pc = RegisterFile.getProgramCounter(); // added: 7/26/06 (explanation above)
                RegisterFile.incrementPC();
+               boolean courseHaltCompletedThisInstruction = false;
+               boolean instructionExecutionPhase = false;
             	// Perform the MIPS instruction in synchronized block.  If external threads agree
             	// to access MIPS memory and registers only through synchronized blocks on same
             	// lock variable, then full (albeit heavy-handed) protection of MIPS memory and
             	// registers is assured.  Not as critical for reading from those resources.
                synchronized (Globals.memoryAndRegistersLock) {
                   try {
+                     if (courseP7HandlerActive &&
+                        (Globals.HWInt & ~courseP7HandlerPreviousHwInt) != 0) {
+                        throw newCourseP7HwIntRiseViolation(
+                           statement, courseP7HandlerEntryHwInt,
+                           courseP7HandlerPreviousHwInt);
+                     }
+                     if (courseP7HandlerActive) {
+                        courseP7HandlerPreviousHwInt = Globals.HWInt;
+                     }
                      if (Simulator.externalInterruptingDevice != NO_DEVICE) {
                         int deviceInterruptCode = externalInterruptingDevice;
                         Simulator.externalInterruptingDevice = NO_DEVICE;
@@ -414,6 +642,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                            throw new ProcessingException(0); // Int exception, ExcCode=0
                         }
                      }
+                     instructionExecutionPhase = true;
                      BasicInstruction instruction = (BasicInstruction)statement.getInstruction();
                      if (instruction == null) {
                         throw new ProcessingException(statement,
@@ -424,6 +653,31 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                      Globals.displayRFchanging.clear();
                      Globals.displayDMchanging.clear();
                      instruction.getSimulationCode().simulate(statement);
+                     if (courseP7HandlerActive) {
+                        if ((Globals.HWInt & ~courseP7HandlerPreviousHwInt) != 0) {
+                           throw newCourseP7HwIntRiseViolation(
+                              statement, courseP7HandlerEntryHwInt,
+                              courseP7HandlerPreviousHwInt);
+                        }
+                        // Capture acknowledgements/clears before Timer.update(), so a
+                        // same-bit 0->1 transition caused by that update is still new.
+                        courseP7HandlerPreviousHwInt = Globals.HWInt;
+                     }
+                     if (courseHaltAddress != null) {
+                        int haltAddress = courseHaltAddress.intValue();
+                        if (!Globals.getSettings().getDelayedBranchingEnabled()) {
+                           courseHaltCompletedThisInstruction = pc == haltAddress;
+                        }
+                        else if (courseHaltDelaySlotPending) {
+                           courseHaltCompletedThisInstruction =
+                              pc == haltAddress + Instruction.INSTRUCTION_LENGTH &&
+                              DelayedBranch.isTriggered() && statement.getBinaryStatement() == 0;
+                           courseHaltDelaySlotPending = false;
+                        }
+                        else if (pc == haltAddress) {
+                           courseHaltDelaySlotPending = true;
+                        }
+                     }
                      // P7: update timers after instruction execution
                      if (Globals.getSettings().getExceptionForCourse()) {
                         TimerOne.update();
@@ -434,6 +688,15 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                         }
                         if (DelayedBranch.isTryjbranch()) {
                            DelayedBranch.tryChange();
+                        }
+                        if (courseP7HandlerActive &&
+                           (Globals.HWInt & ~courseP7HandlerPreviousHwInt) != 0) {
+                           throw newCourseP7HwIntRiseViolation(
+                              statement, courseP7HandlerEntryHwInt,
+                              courseP7HandlerPreviousHwInt);
+                        }
+                        if (courseP7HandlerActive) {
+                           courseP7HandlerPreviousHwInt = Globals.HWInt;
                         }
                      }
                      cycleCounter.update(statement);  // added 3-Sept-2024, by swkfk to count cycles
@@ -470,7 +733,19 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                   }
                }
                       catch (ProcessingException pe) {
-                        // P7: update timers on exception too
+                         if (pe.isCourseContractViolation()) {
+                            return terminateCourseP7ContractViolation(pe, pc);
+                         }
+                         if (courseP7HandlerActive) {
+                            return terminateCourseP7ContractViolation(
+                               ProcessingException.courseContractViolation(statement,
+                                  "loaded-handler instruction at " +
+                                  Binary.intToHexString(pc) +
+                                  (instructionExecutionPhase
+                                     ? " raised a synchronous exception."
+                                     : " was interrupted before execution.")), pc);
+                         }
+                         // P7: update timers on exception too
                         if (Globals.getSettings().getExceptionForCourse()) {
                            TimerOne.update();
                            TimerTwo.update();
@@ -524,6 +799,15 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                         }
                      }
                }// end synchronized block
+
+               if (courseHaltCompletedThisInstruction) {
+                  lastTerminationReason = COURSE_HALT;
+                  this.constructReturnReason = COURSE_HALT;
+                  this.done = true;
+                  SystemIO.resetFiles();
+                  Simulator.getInstance().notifyObserversOfExecutionStop(maxSteps, pc);
+                  return new Boolean(done);
+               }
             	
             	///////// DPS 15 June 2007.  Handle delayed branching if it occurs./////
                if (DelayedBranch.isTriggered()) {
@@ -581,10 +865,21 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             
                // Get next instruction in preparation for next iteration.
 
-               // P7: check PC alignment and range before fetch
+               // Course runs validate the PC before every fetch.  P7 dispatches
+               // AdEL to its handler; earlier projects fail immediately instead
+               // of accepting statements MARS happens to hold beyond the
+               // submitted text image.
+               int nextPC = RegisterFile.getProgramCounter();
+               if (!Globals.getSettings().getExceptionForCourse() &&
+                  isInvalidNonP7CourseFetchAddress(nextPC)) {
+                  return terminateCourseInstructionAddressError(nextPC, pc);
+               }
                if (Globals.getSettings().getExceptionForCourse()) {
-                  int nextPC = RegisterFile.getProgramCounter();
-                  if (isInvalidCourseFetchAddress(nextPC)) {
+                  if (isInvalidP7FetchAddress(nextPC)) {
+                     if (isUnloadedP7CourseHandler()) {
+                        return terminateCourseInstructionAddressError(
+                           Memory.exceptionHandlerAddress, pc);
+                     }
                      // Handle fetch exception inline
                      ProgramStatement exceptionHandler = dispatchCourseFetchException();
                      if (exceptionHandler != null) {
@@ -597,15 +892,22 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
                         SystemIO.resetFiles();
                         Simulator.getInstance().notifyObserversOfExecutionStop(maxSteps, pc);
                         return new Boolean(done);
+                   }
+                }
+                  else if (isUnloadedP7CourseFetchAddress(nextPC)) {
+                     return terminateCourseInstructionAddressError(nextPC, pc);
                   }
-               }
-               }
+                }
 
                try {
-                  statement = Globals.memory.getStatement(RegisterFile.getProgramCounter());
+                  statement = getCourseStatement(RegisterFile.getProgramCounter());
                }
                   catch (AddressErrorException e) {
                      if (Globals.getSettings().getExceptionForCourse()) {
+                        if (isUnloadedP7CourseHandler()) {
+                           return terminateCourseInstructionAddressError(
+                              Memory.exceptionHandlerAddress, pc);
+                        }
                         // P7: fetch exception - use ADDRESS_EXCEPTION_LOAD
                         ProgramStatement exceptionHandler = dispatchCourseFetchException();
                         if (exceptionHandler != null) {

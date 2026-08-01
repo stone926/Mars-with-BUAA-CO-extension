@@ -1094,6 +1094,39 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
    		
     /*********************************  THE UTILITIES  *************************************/
 
+      /**
+       * Validate an effective address produced by a simulated MIPS load/store.
+       *
+       * CompactLargeText also contains text and kernel-data segments in the
+       * 0x3000-0x7EFF interval.  Those segments are useful to the assembler,
+       * exception-handler loader and dump tools, but they are not data-mapped
+       * devices in the P7 course micro-system.  Keep this check out of the
+       * generic get/set methods so those internal users remain unaffected.
+       *
+       * @param address effective byte address of the simulated instruction
+       * @param length number of consecutive bytes accessed
+       * @param exceptionType ADDRESS_EXCEPTION_LOAD or ADDRESS_EXCEPTION_STORE
+       * @throws AddressErrorException if a course address mode is enabled and any byte is unmapped
+       */
+       public void validateCourseDataAddress(int address, int length, int exceptionType)
+         throws AddressErrorException {
+         boolean exceptionForCourse = Globals.getSettings().getExceptionForCourse();
+         if (!exceptionForCourse && !Globals.getSettings().getStrictDataAccess()) {
+            return;
+         }
+         long endAddress = (long) address + (long) length - 1L;
+         if (length > 0 &&
+            ((address >= 0x00000000 && endAddress <= 0x00002FFFL) ||
+             (exceptionForCourse &&
+              ((address >= 0x00007F00 && endAddress <= 0x00007F0BL) ||
+               (address >= 0x00007F10 && endAddress <= 0x00007F1BL) ||
+               (address >= 0x00007F20 && endAddress <= 0x00007F23L))))) {
+            return;
+         }
+         throw new AddressErrorException("course data address out of range",
+            exceptionType, address);
+      }
+
        private static boolean inP7Timer0(int address) {
          return address >= 0x7F00 && address < 0x7F0C;
       }
@@ -1159,7 +1192,11 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     *  false otherwise.
     */
        public static boolean inTextSegment(int address) {
-         return  address >= textBaseAddress && address < textLimitAddress;
+         return address >= textBaseAddress &&
+            (address < textLimitAddress ||
+             ((Globals.getSettings().getExceptionForCourse() ||
+               Globals.getSettings().getStrictDataAccess()) &&
+              address == textLimitAddress));
       }
    
    /**
@@ -1170,7 +1207,11 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     *  false otherwise.
     */
        public static boolean inKernelTextSegment(int address) {
-         return  address >= kernelTextBaseAddress && address < kernelTextLimitAddress;
+         return address >= kernelTextBaseAddress &&
+            (address < kernelTextLimitAddress ||
+             ((Globals.getSettings().getExceptionForCourse() ||
+               Globals.getSettings().getStrictDataAccess()) &&
+              address == kernelTextLimitAddress));
       }	
    
     /**
@@ -1183,7 +1224,11 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     *  false otherwise.
     */
        public static boolean inDataSegment(int address) {
-         return  address >= dataSegmentBaseAddress && address < dataSegmentLimitAddress;
+         return address >= dataSegmentBaseAddress &&
+            (address < dataSegmentLimitAddress ||
+             ((Globals.getSettings().getExceptionForCourse() ||
+               Globals.getSettings().getStrictDataAccess()) &&
+              address == dataSegmentLimitAddress));
       }  
    
     /**

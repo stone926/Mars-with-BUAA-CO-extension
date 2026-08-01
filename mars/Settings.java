@@ -266,6 +266,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       private String[] colorSettingsValues;
       private ArrayList<Integer> p7IrqPcList = null;
       private ArrayList<Integer> p7IrqPcFired = new ArrayList<Integer>();
+      private boolean strictDataAccess = false;
    
       private Preferences preferences;
    	
@@ -378,6 +379,18 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
        public void setExceptionForCourse(boolean value) {
            setBooleanSettingNonPersistent(EXCEPTION_FOR_COURSE, value);
+       }
+
+       /**
+        * Whether simulated load/store instructions use the BUAA CO data-address map.
+        * This command-line-only setting is deliberately not persisted.
+        */
+       public boolean getStrictDataAccess() {
+           return strictDataAccess;
+       }
+
+       public void setStrictDataAccess(boolean value) {
+           strictDataAccess = value;
        }
 
       public int getOutputLoggingLevel() {
